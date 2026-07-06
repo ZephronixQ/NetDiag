@@ -31,8 +31,8 @@ def analyze_onu_results(results: Dict[str, Any]) -> List[str]:
     if not signal_active:
         notes.append("❌ Оптический сигнал отсутствует. ONU обесточена либо повреждена оптическая линия.")
     else:
-        # Если сигнал в сети, но затухание превышает норму (30 dB)
-        if (down_atten and down_atten >= 30.0) or (down_rx and down_rx <= -27.0):
+        # Если сигнал в сети, но затухание превышает норму (40 dB)
+        if (down_atten and down_atten >= 40.0) or (down_rx and down_rx <= -32.0):
             notes.append(
                 f"⚠️ Высокое затухание сигнала (Затухание: {down_atten or 'N/A'} dB, Rx: {down_rx or 'N/A'} dBm). "
                 f"Возможен сильный изгиб кабеля или загрязнение коннектора."

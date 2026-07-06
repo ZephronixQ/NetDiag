@@ -1,4 +1,5 @@
 import asyncio
+import re
 from typing import Optional
 from core.connection import read_and_negotiate, read_all_diagnostics
 from .commands import ZteC300Commands
@@ -15,7 +16,8 @@ async def execute_c300_diagnostics(
     reader: asyncio.StreamReader, 
     writer: asyncio.StreamWriter, 
     sn_target: str, 
-    discovered_port: Optional[str] = None
+    discovered_port: Optional[str] = None,
+    host: Optional[str] = None
 ) -> dict:
 
     if discovered_port:
@@ -30,6 +32,19 @@ async def execute_c300_diagnostics(
 
     port_short = port.replace("gpon-onu_", "").replace("gpon_onu-", "")
 
+    # Опрашиваем RID отдельно для аппарата 2.13
+    rid_val = "не определен"
+    if host == "172.31.2.13":
+        try:
+            writer.write(f"show port-identification port {port}\n".encode())
+            await writer.drain()
+            port_id_out = await read_and_negotiate(reader, writer, ["#"], timeout=1.5)
+            rid_match = re.search(r"Rid-name\s*:\s*(\S+)", port_id_out, re.IGNORECASE)
+            if rid_match:
+                rid_val = rid_match.group(1).strip()
+        except Exception:
+            pass
+
     writer.write(ZteC300Commands.bulk_diagnostics(port).encode())
     await writer.drain()
     combined_out = await read_all_diagnostics(reader, writer, timeout=3.0, idle_timeout=0.4)
@@ -40,9 +55,12 @@ async def execute_c300_diagnostics(
     rates_data = parse_rates(combined_out)
     network_data = parse_c300_network(combined_out)
 
+    if host != "172.31.2.13":
+        rid_val = detail_data["description"]
+
     return {
         "port_short": port_short,
-        "rid": detail_data["description"],
+        "rid": rid_val,
         "attenuation": atten_data,
         "ethernet": eth_data,
         "rates": rates_data,

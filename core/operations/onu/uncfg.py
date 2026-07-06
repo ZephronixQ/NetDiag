@@ -26,11 +26,17 @@ async def get_unconfigured_onus_from_olt(device_config: dict) -> list:
         writer.close()
         await writer.wait_closed()
         
-        matches = re.findall(
-            r"(gpon[-_](?:onu|olt)[-_]\d+/\d+/\d+)(?::\d+)?\s+([A-Z0-9]{12})", 
-            output, 
-            re.IGNORECASE
-        )
+        matches = []
+        for line in output.splitlines():
+            line_str = line.strip()
+            # Находим порт (например gpon_olt-1/3/1 или gpon-onu_1/1/2)
+            port_match = re.search(r"(gpon[-_](?:onu|olt)[-_]\d+/\d+/\d+)(?::\d+)?", line_str, re.IGNORECASE)
+            if port_match:
+                port_val = port_match.group(1)
+                # Ищем 12-символьный серийный номер в этой же строке
+                sn_matches = re.findall(r"\b([A-Z0-9]{12})\b", line_str, re.IGNORECASE)
+                if sn_matches:
+                    matches.append((port_val, sn_matches[-1]))
         
         for port, sn in matches:
             clean_port = port.replace("gpon-onu_", "").replace("gpon_onu-", "").replace("gpon-olt_", "").replace("gpon_olt-", "")

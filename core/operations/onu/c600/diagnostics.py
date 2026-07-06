@@ -16,7 +16,8 @@ async def execute_zte_diagnostics(
     reader: asyncio.StreamReader, 
     writer: asyncio.StreamWriter, 
     sn_target: str, 
-    discovered_port: Optional[str] = None
+    discovered_port: Optional[str] = None,
+    host: Optional[str] = None
 ) -> dict:
     
     if discovered_port:
