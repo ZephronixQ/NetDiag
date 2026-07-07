@@ -3,13 +3,16 @@ import sys
 import time
 import argparse
 
-from config import OLT_DEVICES
+from config import OLT_DEVICES, SWITCH_CREDS
 from core.connection import establish_session, read_and_negotiate
 from core.operations.onu.parsers import parse_port
 from core.utils.renderer import render_zte_results
 from core.operations.onu.uncfg import run_global_uncfg_search
-# Импортируем логику регистрации из специализированного модуля
 from core.operations.onu.registration import run_registration_flow
+
+# Импортируем логику диагностики и управления L2-коммутаторами доступа (IPoE)
+from core.operations.switch.actions import run_switch_diagnostics, execute_switch_reboot
+from core.operations.switch.renderer import render_ipoe_results
 
 async def probe_olt_for_onu(device_config: dict, sn_target: str):
     try:
@@ -99,33 +102,32 @@ async def run_action_flow(sn_target: str, reboot: bool = False, remove: bool = F
 def print_custom_help():
     print("""
 ================================================================================
-🔌 GPON ONU DIAGNOSTIC & MANAGEMENT TOOL v2
+🔌 GPON & IPoE DIAGNOSTIC & MANAGEMENT TOOL v2
 ================================================================================
-Использование:
+Использование для GPON (ZTE C300/C600):
   python main.py --uncfg
   python main.py --gpon <SERIAL_NUMBER>
   python main.py --gpon <SERIAL_NUMBER> --reboot
   python main.py --gpon <SERIAL_NUMBER> --remove
   python main.py --reg <SERIAL> --vlan <VLAN> --int <INT> --port <PORT_ID> --id <RID_ID>
 
-Доступные операции:
-  --gpon <SERIAL>     Запустить глубокую диагностику ONU на OLT по серийному номеру
-                      (сигнал, статус порта, IP, MAC, история аварий).
-  --reboot            Удаленная перезагрузка ONU (совместно с --gpon).
-  --remove            Удаление конфигурации ONU с порта OLT (совместно с --gpon).
-  --uncfg             Выполнить высокоскоростной параллельный поиск всех новых
-                      (не зарегистрированных) ONU по всей сети OLT.
-  --reg <SERIAL>      Зарегистрировать новую ONU на OLT.
-                      Требует параметры: --vlan, --int, --port, --id.
+Использование для IPoE (Коммутаторы доступа ZTE):
+  python main.py --ipoe <IP_ADDRESS> <PORT>
+  python main.py --ipoe <IP_ADDRESS> <PORT> --reboot
 
-⏳ ФУНКЦИИ В РАЗРАБОТКЕ (будут добавлены в ближайших обновлениях):
-  Мастер интерактивной регистрации для других типов вендоров.
+Доступные операции:
+  --gpon <SERIAL>     Запустить глубокую диагностику ONU на OLT по серийному номеру.
+  --reboot            Удаленная перезагрузка ONU (GPON) / Сброс и перезапуск порта (IPoE).
+  --remove            Удаление конфигурации ONU с порта OLT.
+  --uncfg             Выполнить параллельный поиск всех новых ONU по всей сети OLT.
+  --reg <SERIAL>      Зарегистрировать новую ONU на OLT.
+  --ipoe <IP>         Диагностика порта абонента на L2-коммутаторе доступа.
 ================================================================================
 """)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Утилита диагностики и мониторинга GPON ONU на OLT ZTE C300/C600",
+        description="Утилита диагностики и мониторинга GPON ONU и IPoE коммутаторов доступа ZTE",
         add_help=False
     )
     
@@ -133,11 +135,15 @@ if __name__ == "__main__":
     group.add_argument("--gpon", metavar="SERIAL_NUMBER", type=str, help="Запустить диагностику или управление ONU")
     group.add_argument("--uncfg", action="store_true", help="Поиск незарегистрированных ONU")
     group.add_argument("--reg", metavar="SERIAL_NUMBER", type=str, help="Зарегистрировать новую ONU")
+    group.add_argument("--ipoe", metavar="IP", type=str, help="Запустить диагностику порта коммутатора (IPoE)")
     
-    parser.add_argument("--reboot", action="store_true", help="Отправить команду на перезагрузку ONU")
+    # Позиционный аргумент для быстрого ввода порта коммутатора (например: python main.py --ipoe 10.0.0.5 2)
+    parser.add_argument("switch_port", nargs="?", type=str, help="Номер порта (для операций IPoE)")
+    
+    parser.add_argument("--reboot", action="store_true", help="Отправить команду на перезагрузку")
     parser.add_argument("--remove", action="store_true", help="Удалить конфигурацию ONU")
     
-    # Параметры для регистрации
+    # Параметры для регистрации ONU
     parser.add_argument("--vlan", type=int, help="VLAN для регистрации ONU")
     parser.add_argument("--int", dest="interface", type=str, help="Интерфейс OLT (например, 1/3/1)")
     parser.add_argument("--port", type=int, help="Индекс (ID) ONU на интерфейсе (например, 1)")
@@ -151,18 +157,43 @@ if __name__ == "__main__":
         print_custom_help()
         sys.exit(0)
 
-    if args.uncfg:
+    # Логика выполнения сценариев IPoE
+    if args.ipoe:
+        if not args.switch_port:
+            print("[!] Ошибка: Для диагностики IPoE необходимо указать порт после IP-адреса коммутатора.")
+            print("Пример использования: python main.py --ipoe 172.31.6.200 2")
+            sys.exit(1)
+            
+        async def ipoe_flow():
+            target_ip = args.ipoe.strip()
+            target_port = args.switch_port.strip()
+            
+            if args.reboot:
+                await execute_switch_reboot(target_ip, target_port, SWITCH_CREDS)
+                print("[+] Порт успешно перезагружен, статистика ошибок очищена, блокировка MAC-адресов сброшена.")
+                print("[*] Запускаем повторную проверку порта...\n")
+                await asyncio.sleep(2) # Небольшая пауза для инициализации линка портом
+                
+            results = await run_switch_diagnostics(target_ip, target_port, SWITCH_CREDS)
+            render_ipoe_results(target_ip, target_port, results)
+            
+        asyncio.run(ipoe_flow())
+
+    # Логика работы с GPON uncfg
+    elif args.uncfg:
         if args.reboot or args.remove or args.reg:
             print("[!] Ошибка: Дополнительные флаги несовместимы со сценарием --uncfg.")
             sys.exit(1)
         asyncio.run(run_global_uncfg_search(OLT_DEVICES))
         
+    # Логика диагностики и управления существующими GPON ONU
     elif args.gpon:
         if args.reboot and args.remove:
             print("[!] Ошибка: Нельзя использовать одновременно флаги --reboot и --remove.")
             sys.exit(1)
         asyncio.run(run_action_flow(args.gpon.strip(), reboot=args.reboot, remove=args.remove))
         
+    # Логика регистрации новых ONU
     elif args.reg:
         if not all([args.vlan, args.interface, args.port, args.rid]):
             print("[!] Ошибка: Для регистрации ONU (--reg) необходимо указать все параметры:")
