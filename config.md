@@ -60,4 +60,11 @@ OLT_DEVICES = [
         "type": "c300"
     }
 ]
+
+SWITCH_CREDS = {
+    "username": "admin",
+    "password": "password",
+    "secret": " "
+}
+
 ```
