@@ -29,11 +29,11 @@ if __name__ == "__main__":
             reboot=args.reboot
         ))
 
-    elif args.uncfg:
+    elif args.uncfg or args.uncfg_old:
         if args.reboot or args.remove or args.reg:
-            print("[!] Ошибка: Дополнительные флаги несовместимы со сценарием --uncfg.")
+            print("[!] Ошибка: Дополнительные флаги несовместимы со сценарием поиска незарегистрированных ONU.")
             sys.exit(1)
-        asyncio.run(run_global_uncfg_search(OLT_DEVICES))
+        asyncio.run(run_global_uncfg_search(OLT_DEVICES, show_old=bool(args.uncfg_old)))
         
     elif args.gpon:
         if args.reboot and args.remove:

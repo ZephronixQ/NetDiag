@@ -1,4 +1,3 @@
-# core/operations/onu/flow.py
 import asyncio
 import sys
 import time
@@ -78,6 +77,11 @@ async def run_action_flow(sn_target: str, reboot: bool = False, remove: bool = F
 
             results = await run_diagnostics(active_reader, active_writer, sn_target, discovered_port=target_port, host=found_olt["host"])
             
+            # Сохраняем связку серийного номера и договора в базу известных ONU
+            if "rid" in results and results["rid"] and results["rid"] != "не определен":
+                from core.utils.db import update_known_onu
+                update_known_onu(sn_target, results["rid"])
+
             render_zte_results(found_olt["host"], sn_target, results)
             print(f"[*] Диагностика завершена за {time.time() - start_time:.2f} сек.\n")
 

@@ -228,6 +228,21 @@ async def run_registration_flow(sn_target: str, vlan: int, interface: str, onu_i
         print(f"[!] Неподдерживаемый тип OLT устройства: {olt_type.upper()}")
 
     if success:
+        # Сохранение договора в БД
+        from core.utils.db import update_known_onu, DB_PATH
+        update_known_onu(sn_target, rid)
+        
+        # Удаление серийного номера из списка uncfg
+        import sqlite3
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("DELETE FROM uncfg_history WHERE serial_number=?", (sn_target.upper(),))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
         print("[*] Сохранение изменений в энергонезависимую память (write)...")
         try:
             writer.write(b"write\n")
@@ -243,4 +258,4 @@ async def run_registration_flow(sn_target: str, vlan: int, interface: str, onu_i
     if success:
         print(f"\n[+] Регистрация ONU {sn_target} завершена!")
     else:
-        print(f"\n[!] Регистрация ONU {sn_target} завершилась ошибкой.")
+        print(f"\n[!] Регистрация ONU {sn_target} завершилась ошибкой.")    
