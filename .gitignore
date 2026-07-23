@@ -26,6 +26,7 @@ log/
 # Секретные данные
 config/secrets.py
 config.py
+diagnostic_history.db
 
 # Настройки пользователя IDE
 .vscode/

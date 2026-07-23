@@ -40,8 +40,9 @@ async def execute_onu_registration_c600(
         "exit"
     ]
     
+    # Исправлено формирование vport: vport-1/3/3.5:1 вместо vport-1/3/3.1:5
     commands_part2 = [
-        f"interface vport-{interface}.1:{onu_index}",
+        f"interface vport-{interface}.{onu_index}:1",
         f"service-port 1 user-vlan untagged vlan {vlan}",
         "security packet-limit dhcpv4 ingress 20",
         "security packet-limit arp ingress 20",
@@ -88,7 +89,6 @@ async def execute_onu_registration_c300(
     Выполняет пошаговую регистрацию на OLT C300. 
     Имеет индивидуальное ветвление команд для хоста 172.31.2.13 (2.13).
     """
-    # Выделенный сценарий конфигурации для устройства 2.13
     if host == "172.31.2.13":
         commands_213 = [
             "configure terminal",
@@ -120,7 +120,6 @@ async def execute_onu_registration_c300(
             print(f"[!] Ошибка отправки команд конфигурации на OLT 2.13: {e}")
             return False
 
-    # Общий сценарий для других OLT C300
     try:
         writer.write(b"configure terminal\n")
         await writer.drain()
@@ -258,4 +257,4 @@ async def run_registration_flow(sn_target: str, vlan: int, interface: str, onu_i
     if success:
         print(f"\n[+] Регистрация ONU {sn_target} завершена!")
     else:
-        print(f"\n[!] Регистрация ONU {sn_target} завершилась ошибкой.")    
+        print(f"\n[!] Регистрация ONU {sn_target} завершилась ошибкой.")

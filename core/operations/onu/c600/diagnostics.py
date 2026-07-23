@@ -31,7 +31,13 @@ async def execute_zte_diagnostics(
             raise ValueError(f"ONU с серийным номером {sn_target} не найдена")
 
     port_short = port.replace("gpon-onu_", "").replace("gpon_onu-", "")
-    vport_name = f"vport-{port_short.replace(':', '.1:')}"
+    
+    # Исправлено формирование имени vport (например: 1/3/3:5 -> vport-1/3/3.5:1)
+    if ":" in port_short:
+        base_port, onu_id = port_short.split(":")
+        vport_name = f"vport-{base_port}.{onu_id}:1"
+    else:
+        vport_name = f"vport-{port_short}"
 
     writer.write(ZteC600Commands.port_identification(vport_name).encode())
     await writer.drain()
