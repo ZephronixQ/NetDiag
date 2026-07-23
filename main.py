@@ -1,5 +1,4 @@
-import asyncio
-import sys
+import asyncio, sys
 
 from config import OLT_DEVICES, SWITCH_CREDS
 from cli import parse_arguments, print_custom_help
@@ -17,14 +16,15 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.ipoe:
-        if not args.switch_port:
+        switch_port = args.pos_arg1
+        if not switch_port:
             print("[!] Ошибка: Для диагностики IPoE необходимо указать порт после IP-адреса коммутатора.")
             print("Пример использования: python main.py --ipoe 192.168.6.200 2")
             sys.exit(1)
             
         asyncio.run(run_ipoe_flow(
             target_ip=args.ipoe.strip(),
-            target_port=args.switch_port.strip(),
+            target_port=switch_port.strip(),
             creds=SWITCH_CREDS,
             reboot=args.reboot
         ))
@@ -42,14 +42,19 @@ if __name__ == "__main__":
         asyncio.run(run_action_flow(args.gpon.strip(), reboot=args.reboot, remove=args.remove))
         
     elif args.reg:
-        if not all([args.vlan, args.interface, args.port, args.rid]):
-            print("[!] Ошибка: Для регистрации ONU (--reg) необходимо указать все параметры:")
-            print("    --vlan, --int, --port, --id")
-            sys.exit(1)
+        rid_val = args.rid if args.rid else args.pos_arg1
+        
+        onu_index_val = args.port
+        if not onu_index_val and args.pos_arg2:
+            try:
+                onu_index_val = int(args.pos_arg2)
+            except ValueError:
+                pass
+
         asyncio.run(run_registration_flow(
             sn_target=args.reg.strip(),
+            rid=rid_val.strip() if rid_val else None,
             vlan=args.vlan,
-            interface=args.interface.strip(),
-            onu_index=args.port,
-            rid=args.rid.strip()
+            interface=args.interface.strip() if args.interface else None,
+            onu_index=onu_index_val
         ))

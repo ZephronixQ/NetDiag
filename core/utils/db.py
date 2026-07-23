@@ -52,6 +52,21 @@ def update_known_onu(sn: str, rid: str):
     except Exception:
         pass
 
+def get_known_onu(sn: str) -> str:
+    """Возвращает ранее сохраненный номер договора по серийному номеру."""
+    init_db()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT last_known_rid FROM known_onus WHERE serial_number=?", (sn.upper(),))
+        row = cursor.fetchone()
+        conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    return "не определен"
+
 def track_unconfigured_onus(active_uncfg_list: list) -> dict:
     init_db()
     try:

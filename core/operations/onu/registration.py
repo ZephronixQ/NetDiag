@@ -1,23 +1,79 @@
 import asyncio
 import re
 import sys
+from typing import Optional, Tuple
 from core.connection import establish_session, read_and_negotiate
+from core.utils.db import get_known_onu, update_known_onu, DB_PATH
 
-async def find_unconfigured_onu_olt(sn_target: str, interface_target: str) -> tuple:
+async def find_unconfigured_onu_global(sn_target: str) -> Tuple[Optional[dict], Optional[str]]:
     from core.operations.onu.uncfg import get_unconfigured_onus_from_olt
     from config import OLT_DEVICES
 
-    print(f"[*] Поиск неконфигурированной ONU {sn_target} на порту {interface_target}...")
+    print(f"[*] Глобальный поиск неконфигурированной ONU {sn_target} по всей сети OLT...")
     
     tasks = [get_unconfigured_onus_from_olt(device) for device in OLT_DEVICES]
     results = await asyncio.gather(*tasks)
     
     for device, onus_list in zip(OLT_DEVICES, results):
         for host, clean_port, sn, olt_type in onus_list:
-            if sn.upper() == sn_target.upper() and clean_port == interface_target:
+            if sn.upper() == sn_target.upper() and clean_port != "ошибка опроса":
                 return device, clean_port
                 
     return None, None
+
+async def auto_find_free_onu_index(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, olt_type: str, interface: str) -> int:
+    """
+    Опрашивает порт OLT и возвращает первый наименьший свободный индекс ONU (от 1 до 128).
+    """
+    # Исправлен синтаксис команд для C600 и C300
+    if olt_type == "c600":
+        cmd = f"show gpon onu state gpon_olt-{interface}\n"
+    else:
+        cmd = f"show gpon onu state gpon-olt_{interface}\n"
+
+    writer.write(cmd.encode())
+    await writer.drain()
+    output = await read_and_negotiate(reader, writer, ["#"], timeout=2.5)
+
+    used_indices = set()
+    for line in output.splitlines():
+        match = re.search(r"(\d+/\d+/\d+):(\d+)", line)
+        if match:
+            used_indices.add(int(match.group(2)))
+
+    for candidate in range(1, 129):
+        if candidate not in used_indices:
+            return candidate
+
+    return 1
+
+async def auto_detect_vlan(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, olt_type: str, interface: str) -> Optional[int]:
+    """
+    Определяет VLAN порта путем опроса существующих ONU на этом же интерфейсе.
+    """
+    if olt_type == "c600":
+        for test_idx in range(1, 10):
+            cmd = f"show vlan port vport-{interface}.{test_idx}:1\n"
+            writer.write(cmd.encode())
+            await writer.drain()
+            out = await read_and_negotiate(reader, writer, ["#"], timeout=1.5)
+            
+            vlan_match = re.search(r"(?:TaggedVlan|UntaggedVlan):\s*\r?\n\s*(\d+)", out, re.IGNORECASE)
+            if not vlan_match:
+                vlan_match = re.search(r"vlan\s+(\d+)", out, re.IGNORECASE)
+                
+            if vlan_match:
+                return int(vlan_match.group(1))
+    else:
+        cmd = f"show service-port interface gpon-olt_{interface}\n"
+        writer.write(cmd.encode())
+        await writer.drain()
+        out = await read_and_negotiate(reader, writer, ["#"], timeout=2.0)
+        vlan_match = re.search(r"vlan\s+(\d+)", out, re.IGNORECASE)
+        if vlan_match:
+            return int(vlan_match.group(1))
+
+    return None
 
 async def execute_onu_registration_c600(
     reader: asyncio.StreamReader,
@@ -28,9 +84,6 @@ async def execute_onu_registration_c600(
     vlan: int,
     rid: str
 ) -> bool:
-    """
-    Выполняет пошаговую регистрацию на OLT C600.
-    """
     commands_part1 = [
         "configure terminal",
         f"interface gpon_olt-{interface}",
@@ -40,7 +93,6 @@ async def execute_onu_registration_c600(
         "exit"
     ]
     
-    # Исправлено формирование vport: vport-1/3/3.5:1 вместо vport-1/3/3.1:5
     commands_part2 = [
         f"interface vport-{interface}.{onu_index}:1",
         f"service-port 1 user-vlan untagged vlan {vlan}",
@@ -85,10 +137,6 @@ async def execute_onu_registration_c300(
     rid: str,
     host: str = ""
 ) -> bool:
-    """
-    Выполняет пошаговую регистрацию на OLT C300. 
-    Имеет индивидуальное ветвление команд для хоста 172.31.2.13 (2.13).
-    """
     if host == "172.31.2.13":
         commands_213 = [
             "configure terminal",
@@ -178,21 +226,26 @@ async def execute_onu_registration_c300(
         print(f"[!] Ошибка при отправке команд конфигурации C300: {e}")
         return False
 
-async def run_registration_flow(sn_target: str, vlan: int, interface: str, onu_index: int, rid: str):
-    clean_interface_match = re.search(r"(\d+/\d+/\d+)", interface)
-    if not clean_interface_match:
-        print(f"[!] Ошибка: Неверный формат интерфейса '{interface}'. Ожидается формат типа 1/3/8.")
-        sys.exit(1)
-    clean_interface = clean_interface_match.group(1)
+async def run_registration_flow(
+    sn_target: str, 
+    rid: Optional[str] = None, 
+    vlan: Optional[int] = None, 
+    interface: Optional[str] = None, 
+    onu_index: Optional[int] = None
+):
+    sn_upper = sn_target.upper()
 
-    found_device, detected_port = await find_unconfigured_onu_olt(sn_target, clean_interface)
+    # 1. Поиск устройства на OLT
+    found_device, detected_port = await find_unconfigured_onu_global(sn_upper)
     
     if not found_device:
-        print(f"\n[!] Ошибка: ONU {sn_target} на порту {clean_interface} не найдена в списке незарегистрированных.")
+        print(f"\n[!] Ошибка: ONU {sn_upper} не найдена ни на одном OLT в списке незарегистрированных.")
         sys.exit(1)
         
+    clean_interface = interface if interface else detected_port
     olt_type = found_device['type'].lower()
-    print(f"[+] ONU обнаружена на OLT {found_device['host']} ({olt_type.upper()}) на порту {detected_port}")
+    
+    print(f"[+] ONU обнаружена на OLT {found_device['host']} ({olt_type.upper()}), порт: {clean_interface}")
     
     print(f"[*] Подключение к OLT {found_device['host']}...")
     try:
@@ -200,14 +253,55 @@ async def run_registration_flow(sn_target: str, vlan: int, interface: str, onu_i
     except Exception as e:
         print(f"[!] Ошибка подключения к OLT: {e}")
         sys.exit(1)
-        
+
+    # 2. Авто-определение свободного индекса ONU (если не передан вручную)
+    if not onu_index:
+        print(f"[*] Автопоиск свободного индекса ONU на порту {clean_interface}...")
+        onu_index = await auto_find_free_onu_index(reader, writer, olt_type, clean_interface)
+        print(f"[+] Выбран свободный индекс ONU: {onu_index}")
+
+    # 3. Авто-определение VLAN (если не передан вручную)
+    if not vlan:
+        print(f"[*] Автоопределение VLAN для порта {clean_interface}...")
+        vlan = await auto_detect_vlan(reader, writer, olt_type, clean_interface)
+        if vlan:
+            print(f"[+] Автоматически определен VLAN: {vlan}")
+        else:
+            print(f"[!] ВНИМАНИЕ: Не удалось автоматически определить VLAN (порт чистый).")
+            try:
+                vlan_input = input("👉 Введите номер VLAN вручную: ").strip()
+                vlan = int(vlan_input)
+            except ValueError:
+                print("[!] Ошибка: Введен неверный номер VLAN.")
+                writer.close()
+                await writer.wait_closed()
+                sys.exit(1)
+
+    # 4. Авто-подтягивание договора (если не передан)
+    if not rid:
+        rid = get_known_onu(sn_upper)
+        if rid and rid != "не определен":
+            print(f"[+] Договор автоматически подтянут из базы знаний: {rid}")
+        else:
+            try:
+                rid = input("👉 Введите номер договора (RID): ").strip()
+                if not rid:
+                    raise ValueError()
+            except Exception:
+                print("[!] Ошибка: Номер договора не может быть пустым.")
+                writer.close()
+                await writer.wait_closed()
+                sys.exit(1)
+
+    print(f"\n🚀 Запуск регистрации ONU {sn_upper} на порту {clean_interface}:{onu_index} (VLAN: {vlan}, Договор: {rid})...")
+
     success = False
     if olt_type == "c600":
         success = await execute_onu_registration_c600(
             reader=reader,
             writer=writer,
             interface=clean_interface,
-            sn=sn_target,
+            sn=sn_upper,
             onu_index=onu_index,
             vlan=vlan,
             rid=rid
@@ -217,26 +311,21 @@ async def run_registration_flow(sn_target: str, vlan: int, interface: str, onu_i
             reader=reader,
             writer=writer,
             interface=clean_interface,
-            sn=sn_target,
+            sn=sn_upper,
             onu_index=onu_index,
             vlan=vlan,
             rid=rid,
             host=found_device["host"]
         )
-    else:
-        print(f"[!] Неподдерживаемый тип OLT устройства: {olt_type.upper()}")
 
     if success:
-        # Сохранение договора в БД
-        from core.utils.db import update_known_onu, DB_PATH
-        update_known_onu(sn_target, rid)
+        update_known_onu(sn_upper, rid)
         
-        # Удаление серийного номера из списка uncfg
         import sqlite3
         try:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
-            c.execute("DELETE FROM uncfg_history WHERE serial_number=?", (sn_target.upper(),))
+            c.execute("DELETE FROM uncfg_history WHERE serial_number=?", (sn_upper,))
             conn.commit()
             conn.close()
         except Exception:
@@ -255,6 +344,6 @@ async def run_registration_flow(sn_target: str, vlan: int, interface: str, onu_i
     await writer.wait_closed()
     
     if success:
-        print(f"\n[+] Регистрация ONU {sn_target} завершена!")
+        print(f"\n[+] Регистрация ONU {sn_upper} успешно завершена!")
     else:
-        print(f"\n[!] Регистрация ONU {sn_target} завершилась ошибкой.")
+        print(f"\n[!] Регистрация ONU {sn_upper} завершилась ошибкой.")
