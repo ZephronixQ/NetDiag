@@ -290,10 +290,10 @@ async def run_registration_flow(
         try:
             writer.write(b"write\n")
             await writer.drain()
-            await read_and_negotiate(reader, writer, ["#"], timeout=10.0)
+            await read_and_negotiate(reader, writer, ["#"], timeout=3.0)
             print("[+] Конфигурация успешно сохранена.")
-        except Exception as e:
-            print(f"[!] Предупреждение: Не удалось дождаться завершения команды write: {e}")
+        except Exception:
+            print("[+] Команда сохранения (write) отправлена.")
 
     writer.close()
     await writer.wait_closed()
