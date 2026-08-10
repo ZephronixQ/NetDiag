@@ -6,10 +6,11 @@ from core.connection import establish_session, read_and_negotiate
 from core.utils.db import get_known_onu, update_known_onu, DB_PATH
 
 async def find_unconfigured_onu_global(sn_target: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Глобальный параллельный поиск незарегистрированной ONU по всей сети OLT."""
     from core.operations.onu.uncfg import get_unconfigured_onus_from_olt
     from config import OLT_DEVICES
 
-    print(f"[*] Глобальный поиск неконфигурированной ONU {sn_target} по всей сети OLT...")
+    print(f"[*] Глобальный параллельный поиск неконфигурированной ONU {sn_target} по всей сети OLT...")
     
     tasks = [get_unconfigured_onus_from_olt(device) for device in OLT_DEVICES]
     results = await asyncio.gather(*tasks)
@@ -22,10 +23,7 @@ async def find_unconfigured_onu_global(sn_target: str) -> Tuple[Optional[dict], 
     return None, None
 
 async def auto_find_free_onu_index(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, olt_type: str, interface: str) -> int:
-    """
-    Опрашивает порт OLT и возвращает первый наименьший свободный индекс ONU (от 1 до 128).
-    """
-    # Исправлен синтаксис команд для C600 и C300
+    """Опрашивает порт OLT и возвращает первый наименьший свободный индекс ONU (от 1 до 128)."""
     if olt_type == "c600":
         cmd = f"show gpon onu state gpon_olt-{interface}\n"
     else:
@@ -49,10 +47,10 @@ async def auto_find_free_onu_index(reader: asyncio.StreamReader, writer: asyncio
 
 async def auto_detect_vlan(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, olt_type: str, interface: str) -> Optional[int]:
     """
-    Определяет VLAN порта путем опроса существующих ONU на этом же интерфейсе.
+    Автоматически определяет VLAN, последовательно проверяя конфигурацию ONU с 1 по 10 индекс на порту.
     """
     if olt_type == "c600":
-        for test_idx in range(1, 10):
+        for test_idx in range(1, 11):
             cmd = f"show vlan port vport-{interface}.{test_idx}:1\n"
             writer.write(cmd.encode())
             await writer.drain()
@@ -65,13 +63,27 @@ async def auto_detect_vlan(reader: asyncio.StreamReader, writer: asyncio.StreamW
             if vlan_match:
                 return int(vlan_match.group(1))
     else:
-        cmd = f"show service-port interface gpon-olt_{interface}\n"
-        writer.write(cmd.encode())
-        await writer.drain()
-        out = await read_and_negotiate(reader, writer, ["#"], timeout=2.0)
-        vlan_match = re.search(r"vlan\s+(\d+)", out, re.IGNORECASE)
-        if vlan_match:
-            return int(vlan_match.group(1))
+        # Для C300: последовательно проверяем ONU с 1 по 10 индекс на порту
+        for test_idx in range(1, 11):
+            cmd = f"show service-port interface gpon-onu_{interface}:{test_idx}\n"
+            writer.write(cmd.encode())
+            await writer.drain()
+            out = await read_and_negotiate(reader, writer, ["#"], timeout=1.5)
+            
+            # Разбираем вывод таблицы service-port
+            for line in out.splitlines():
+                parts = line.strip().split()
+                # Строка таблицы: 1 1 10 10 -- -- -- -- 3971 -- ...
+                # parts[0] = Sport (1), parts[8] = Vlan (3971)
+                if len(parts) >= 9 and parts[0] == "1" and parts[8].isdigit():
+                    found_vlan = int(parts[8])
+                    if found_vlan > 0:
+                        return found_vlan
+            
+            # Резервный поиск на случай разницы в форматировании таблицы
+            vlan_match = re.search(r"\d+\s+\d+\s+\d+\s+\d+\s+[\w\.-]+\s+[\w\.-]+\s+[\w\.-]+\s+[\w\.-]+\s+(\d+)", out)
+            if vlan_match:
+                return int(vlan_match.group(1))
 
     return None
 
@@ -84,6 +96,7 @@ async def execute_onu_registration_c600(
     vlan: int,
     rid: str
 ) -> bool:
+    """Конфигурирование и регистрация ONU для OLT C600."""
     commands_part1 = [
         "configure terminal",
         f"interface gpon_olt-{interface}",
@@ -137,93 +150,35 @@ async def execute_onu_registration_c300(
     rid: str,
     host: str = ""
 ) -> bool:
-    if host == "172.31.2.13":
-        commands_213 = [
-            "configure terminal",
-            f"interface gpon-olt_{interface}",
-            f"onu {onu_index} type ZTE-F601 sn {sn}",
-            f"onu {onu_index} profile line LP_ONU-1G remote bridge",
-            "exit",
-            f"interface gpon-onu_{interface}:{onu_index}",
-            f"service-port 1 vport 1 user-vlan 10 vlan {vlan}",
-            "ip dhcp snooping enable vport 1",
-            "port-identification format MAIN vport 1",
-            "port-identification sub-option remote-id enable vport 1",
-            f"port-identification sub-option remote-id name {rid} vport 1",
-            "dhcpv4-l2-relay-agent enable vport 1",
-            "dhcpv4-l2-relay-agent trust true replace vport 1",
-            "security storm-control broadcast rate 256 direction ingress vport 1",
-            "security max-mac-learn 5 vport 1",
-            "exit",
-            "exit"
-        ]
-        try:
-            print("[*] Запись специальной конфигурации для OLT 2.13 (ZTE-F601)...")
-            for cmd in commands_213:
-                writer.write(f"{cmd}\n".encode())
-                await writer.drain()
-                await read_and_negotiate(reader, writer, ["#"])
-            return True
-        except Exception as e:
-            print(f"[!] Ошибка отправки команд конфигурации на OLT 2.13: {e}")
-            return False
-
+    """Конфигурирование и регистрация ONU для OLT C300."""
+    commands_c300 = [
+        "configure terminal",
+        f"interface gpon-olt_{interface}",
+        f"onu {onu_index} type ZTE-F601 sn {sn}",
+        f"onu {onu_index} profile line LP_ONU-1G remote bridge",
+        "exit",
+        f"interface gpon-onu_{interface}:{onu_index}",
+        f"service-port 1 vport 1 user-vlan 10 vlan {vlan}",
+        "ip dhcp snooping enable vport 1",
+        "port-identification format MAIN vport 1",
+        "port-identification sub-option remote-id enable vport 1",
+        f"port-identification sub-option remote-id name {rid} vport 1",
+        "dhcpv4-l2-relay-agent enable vport 1",
+        "dhcpv4-l2-relay-agent trust true replace vport 1",
+        "security storm-control broadcast rate 256 direction ingress vport 1",
+        "security max-mac-learn 5 vport 1",
+        "exit",
+        "exit"
+    ]
     try:
-        writer.write(b"configure terminal\n")
-        await writer.drain()
-        await read_and_negotiate(reader, writer, ["#"])
-
-        writer.write(f"interface gpon-olt_{interface}\n".encode())
-        await writer.drain()
-        await read_and_negotiate(reader, writer, ["#"])
-
-        writer.write(f"onu {onu_index} type ONT_1G sn {sn}\n".encode())
-        await writer.drain()
-        await read_and_negotiate(reader, writer, ["#"])
-
-        cmd_v1 = f"onu {onu_index} profile line LP_ONU-1G remote VLAN{vlan}\n"
-        writer.write(cmd_v1.encode())
-        await writer.drain()
-        response = await read_and_negotiate(reader, writer, ["#"], timeout=2.0)
-        
-        if any(err in response.lower() for err in ["error", "invalid", "unrecognized", "parameter"]):
-            print("[!] Опция 'remote' не поддерживается на данной прошивке C300. Применяется резервный профиль...")
-            cmd_v2 = f"onu {onu_index} profile line LP_ONU-1G\n"
-            writer.write(cmd_v2.encode())
-            await writer.drain()
-            await read_and_negotiate(reader, writer, ["#"])
-
-        writer.write(b"exit\n")
-        await writer.drain()
-        await read_and_negotiate(reader, writer, ["#"])
-
-        commands_onu = [
-            f"interface gpon-onu_{interface}:{onu_index}",
-            f"description {rid}",
-            "max-mac-learn 5 vport 1",
-            "security storm-control broadcast rate 256 direction ingress vport 1",
-            "switchport mode hybrid vport 1",
-            f"service-port 1 vport 1 user-vlan untag vlan {vlan}",
-            "port-location format flexible-syntax vport 1",
-            "port-location sub-option remote-id enable vport 1",
-            f"port-location sub-option remote-id name {rid} vport 1",
-            "dhcp-option82 enable vport 1",
-            "dhcp-option82 trust true replace vport 1",
-            "ip dhcp snooping enable vport 1",
-            "ip-service ip-source-guard enable sport 1",
-            "exit",
-            "exit"
-        ]
-
-        print("[*] Настройка сервисного порта и политик трафика (C300)...")
-        for cmd in commands_onu:
+        print(f"[*] Запись конфигурации для OLT C300 ({host})...")
+        for cmd in commands_c300:
             writer.write(f"{cmd}\n".encode())
             await writer.drain()
             await read_and_negotiate(reader, writer, ["#"])
-
         return True
     except Exception as e:
-        print(f"[!] Ошибка при отправке команд конфигурации C300: {e}")
+        print(f"[!] Ошибка отправки команд конфигурации на OLT C300 ({host}): {e}")
         return False
 
 async def run_registration_flow(
@@ -260,14 +215,14 @@ async def run_registration_flow(
         onu_index = await auto_find_free_onu_index(reader, writer, olt_type, clean_interface)
         print(f"[+] Выбран свободный индекс ONU: {onu_index}")
 
-    # 3. Авто-определение VLAN (если не передан вручную)
+    # 3. Авто-определение VLAN (проверка ONU с 1 по 10 индекс)
     if not vlan:
-        print(f"[*] Автоопределение VLAN для порта {clean_interface}...")
+        print(f"[*] Автоопределение VLAN для порта {clean_interface} (проверка ONU 1..10)...")
         vlan = await auto_detect_vlan(reader, writer, olt_type, clean_interface)
         if vlan:
             print(f"[+] Автоматически определен VLAN: {vlan}")
         else:
-            print(f"[!] ВНИМАНИЕ: Не удалось автоматически определить VLAN (порт чистый).")
+            print(f"[!] ВНИМАНИЕ: Не удалось автоматически определить VLAN (порт полностью чистый).")
             try:
                 vlan_input = input("👉 Введите номер VLAN вручную: ").strip()
                 vlan = int(vlan_input)

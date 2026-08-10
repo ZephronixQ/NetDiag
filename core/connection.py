@@ -92,7 +92,7 @@ async def read_all_diagnostics(reader: asyncio.StreamReader, writer: asyncio.Str
         i += 1
     return clean_bytes.decode("utf-8", errors="ignore")
 
-async def establish_session(config: Dict[str, Any]) -> tuple:
+async def _establish_session_internal(config: Dict[str, Any]) -> tuple:
     reader, writer = await asyncio.open_connection(config["host"], config["port"])
     try:
         await read_and_negotiate(reader, writer, ["Username:", "login:", "User Name:"])
@@ -124,3 +124,10 @@ async def establish_session(config: Dict[str, Any]) -> tuple:
         writer.close()
         await writer.wait_closed()
         raise e
+
+async def establish_session(config: Dict[str, Any], timeout: float = 10.0) -> tuple:
+    """Устанавливает сессию с OLT/Switch с лимитом времени подключения (по умолчанию 10 секунд)."""
+    try:
+        return await asyncio.wait_for(_establish_session_internal(config), timeout=timeout)
+    except Exception as e:
+        raise ConnectionError(f"Не удалось подключиться к {config.get('host')}: {e}")
