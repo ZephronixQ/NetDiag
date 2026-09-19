@@ -8,7 +8,6 @@ from core.connection import establish_session, read_and_negotiate
 from core.utils.db import get_known_onu, update_known_onu, DB_PATH
 
 async def find_unconfigured_onu_global(sn_target: str) -> Tuple[Optional[dict], Optional[str]]:
-    """Глобальный параллельный поиск незарегистрированной ONU по всей сети OLT."""
     from core.operations.onu.uncfg import get_unconfigured_onus_from_olt
     from config import OLT_DEVICES
 
@@ -48,11 +47,6 @@ async def auto_find_free_onu_index(reader: asyncio.StreamReader, writer: asyncio
     return 1
 
 async def auto_detect_vlan(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, olt_type: str, interface: str) -> Optional[int]:
-    """
-    Определяет рабочий VLAN абонентов на порту на основе частотного анализа (Majority Voting).
-    Последовательно опрашивает ONU 1..10 на порту, собирает статистику и выбирает доминирующий VLAN
-    (а при равенстве голосов — наибольший по номеру, исключая белые IP/служебные пулы).
-    """
     found_vlans = []
 
     if olt_type == "c600":
