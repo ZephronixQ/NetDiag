@@ -50,13 +50,13 @@ async def auto_find_free_onu_index(reader: asyncio.StreamReader, writer: asyncio
 async def auto_detect_vlan(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, olt_type: str, interface: str) -> Optional[int]:
     """
     Определяет рабочий VLAN абонентов на порту на основе частотного анализа (Majority Voting).
-    Собирает VLAN у работающих ONU порта и выбирает наиболее популярный VLAN 
-    (а при равенстве голосов — наибольший по номеру, исключая случайный выбор белых IP/служебных VLAN).
+    Последовательно опрашивает ONU 1..10 на порту, собирает статистику и выбирает доминирующий VLAN
+    (а при равенстве голосов — наибольший по номеру, исключая белые IP/служебные пулы).
     """
     found_vlans = []
 
     if olt_type == "c600":
-        # Сканируем с 1 по 10 индекс на C600
+        # Сканируем vport с 1 по 10 индекс на C600
         for test_idx in range(1, 11):
             cmd = f"show vlan port vport-{interface}.{test_idx}:1\n"
             writer.write(cmd.encode())
@@ -71,40 +71,62 @@ async def auto_detect_vlan(reader: asyncio.StreamReader, writer: asyncio.StreamW
                 val = int(vlan_match.group(1))
                 if val > 0:
                     found_vlans.append(val)
+
+            # Ранний выход: если уже нашли 4 одинаковых VLAN — дерево очевидно
+            if len(found_vlans) >= 4 and len(set(found_vlans)) == 1:
+                break
     else:
-        # Для C300: запрашиваем всю таблицу service-port целевого порта за одну команду (быстрее в разы)
-        cmd = f"show service-port interface gpon-olt_{interface}\n"
-        writer.write(cmd.encode())
-        await writer.drain()
-        out = await read_and_negotiate(reader, writer, ["#"], timeout=3.0)
-        
-        for line in out.splitlines():
-            parts = line.strip().split()
-            # Формат строки вывода C300:
-            # 1 1 10 10 -- -- -- -- 3642 -- ...
-            # parts[0] = Sport (1), parts[8] = Vlan (3642)
-            if len(parts) >= 9 and parts[8].isdigit():
-                val = int(parts[8])
-                if val > 0:
-                    found_vlans.append(val)
+        # Для C300/C320 (V2.1.0): опрашиваем service-port существующих ONU от 1 до 10
+        for test_idx in range(1, 11):
+            cmd = f"show service-port interface gpon-onu_{interface}:{test_idx}\n"
+            writer.write(cmd.encode())
+            await writer.drain()
+            out = await read_and_negotiate(reader, writer, ["#"], timeout=1.5)
+            
+            # Разбираем вывод таблицы service-port
+            matched_current = False
+            for line in out.splitlines():
+                parts = line.strip().split()
+                # Формат строки вывода C300:
+                # 1 1 10 10 -- -- -- -- 3971 -- ...
+                # parts[0] = Sport (1), parts[8] = Vlan (3971)
+                if len(parts) >= 9 and parts[0] == "1" and parts[8].isdigit():
+                    val = int(parts[8])
+                    if val > 0:
+                        found_vlans.append(val)
+                        matched_current = True
+                        break
+            
+            # Резервный регулярный парсер на случай сдвига колонок
+            if not matched_current:
+                vlan_match = re.search(r"^\s*1\s+\d+\s+\d+\s+\d+\s+[\w\.-]+\s+[\w\.-]+\s+[\w\.-]+\s+[\w\.-]+\s+(\d+)", out, re.MULTILINE)
+                if not vlan_match:
+                    vlan_match = re.search(r"\d+\s+\d+\s+\d+\s+\d+\s+[\w\.-]+\s+[\w\.-]+\s+[\w\.-]+\s+[\w\.-]+\s+(\d+)", out)
+                if vlan_match:
+                    val = int(vlan_match.group(1))
+                    if val > 0:
+                        found_vlans.append(val)
+
+            # Ранний выход: если собрали 4 одинаковых VLAN подряд — нет смысла ждать опрос 10 штук
+            if len(found_vlans) >= 4 and len(set(found_vlans)) == 1:
+                break
 
     if not found_vlans:
         return None
 
-    # Подсчитываем частоту использования каждого VLAN на дереве
+    # Подсчитываем частоту использования каждого VLAN
     vlan_counts = Counter(found_vlans)
     
-    # Лог для инженера NOC
+    # Информативный лог для инженера
     stats_str = ", ".join([f"VLAN {v} ({c} шт.)" for v, c in vlan_counts.items()])
-    print(f"[*] Статистика VLAN на порту {interface}: {stats_str}")
+    print(f"[*] Статистика VLAN на дереве {interface}: {stats_str}")
 
     # Сортировка:
-    # 1. По частоте встречаемости (x[1]) — чем больше абонентов, тем выше
-    # 2. По номеру VLAN (x[0]) — при равенстве (например, 1 абонент с 1899 и 1 с 3642) побеждает БОЛЬШИЙ (3642)
+    # 1. По популярности (x[1]) — большинство побеждает
+    # 2. По номеру (x[0]) — при паритете (1:1) побеждает старший (например, 3971 > 1899)
     sorted_vlans = sorted(vlan_counts.items(), key=lambda x: (x[1], x[0]), reverse=True)
     
-    selected_vlan = sorted_vlans[0][0]
-    return selected_vlan
+    return sorted_vlans[0][0]
 
 async def execute_onu_registration_c600(
     reader: asyncio.StreamReader,
@@ -239,7 +261,7 @@ async def run_registration_flow(
         print(f"[*] Анализ конфигурации абонентов для автоопределения VLAN на {clean_interface}...")
         vlan = await auto_detect_vlan(reader, writer, olt_type, clean_interface)
         if vlan:
-            print(f"[+] Автоматически выбран доминирующий/основной VLAN: {vlan}")
+            print(f"[+] Автоматически выбран основной VLAN: {vlan}")
         else:
             print(f"[!] ВНИМАНИЕ: Не удалось автоматически определить VLAN (порт полностью чистый).")
             try:
